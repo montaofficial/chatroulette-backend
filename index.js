@@ -1,109 +1,90 @@
+// backend/index.js
+
 const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const dataStore = require('./dataStore');
 const cors = require('cors');
-const { v4: uuidv4 } = require('uuid');
 
 const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+    cors: {
+        origin: '*',
+        methods: ['GET', 'POST'],
+    },
+});
+
+const PORT = process.env.PORT || 8124;
+
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+io.on('connection', (socket) => {
+    console.log('New client connected:', socket.id);
 
-let users = [];
-
-// Utility function to clean up inactive sessions
-function cleanUpSessions() {
-    const currentTime = Date.now();
-    users = users.filter(user => currentTime - user.lastPing <= 15000);
-}
-
-// Registration Endpoint
-app.post('/register', (req, res) => {
-    const { age, gender, country, nickname, negotiationString } = req.body;
-
-    const sessionId = uuidv4();
-    const timestamp = Date.now();
-
-    const user = {
-        sessionId,
-        age,
-        gender,
-        country,
-        nickname,
-        negotiationString,
-        lastSeen: timestamp,
-        lastPing: timestamp,
-        connectedTo: null,
-    };
-
-    users.push(user);
-
-    res.json({ sessionId });
-});
-
-// Get User Endpoint
-app.get('/get-user', (req, res) => {
-    cleanUpSessions();
-
-    const activeUsers = users.filter(user => {
-        const isActive = Date.now() - user.lastPing <= 15000;
-        return isActive && !user.connectedTo;
+    // User Registration
+    socket.on('register', ({ age, gender, country, nickname, bio }) => {
+        if (!nickname) {
+            socket.emit('registration-failed', { error: 'Nickname is required.' });
+            return;
+        }
+        const user = dataStore.addUser(age || 0, gender || "other", country || "", nickname, bio || "", socket.id);
+        socket.sessionId = user.sessionId; // Store session ID in socket
+        socket.user = user; // Store session ID in socket
+        socket.emit('registered', user);
+        console.log(`${nickname} registered with session ID: ${user.sessionId}`);
     });
 
-    if (activeUsers.length === 0) {
-        return res.status(404).json({ message: 'No active users available' });
-    }
-
-    const randomIndex = Math.floor(Math.random() * activeUsers.length);
-    const selectedUser = activeUsers[randomIndex];
-
-    // Mark the user as connected
-    selectedUser.connectedTo = 'main-user-session-id'; // Replace with actual session ID if needed
-
-    res.json({
-        sessionId: selectedUser.sessionId,
-        age: selectedUser.age,
-        gender: selectedUser.gender,
-        country: selectedUser.country,
-        nickname: selectedUser.nickname,
-        negotiationString: selectedUser.negotiationString,
-    });
-});
-
-// Get Queue Endpoint
-app.get('/get-queue', (req, res) => {
-    cleanUpSessions();
-
-    const currentTime = Date.now();
-    let activeCount = 0;
-    let expiredCount = 0;
-
-    users.forEach(user => {
-        if (currentTime - user.lastPing <= 15000) {
-            activeCount++;
+    // Get Random User from Queue
+    socket.on('get-user', () => {
+        const randomUser = dataStore.getRandomUser(socket.sessionId);
+        if (randomUser) {
+            socket.emit('user-found', { randomUser, caller: true });
+            io.to(randomUser.sessionId).emit('user-found', { randomUser: socket.user, caller: false });
+            console.log(`User ${socket.sessionId} connected with user ${randomUser.sessionId}`);
         } else {
-            expiredCount++;
+            socket.emit('user-not-found');
         }
     });
 
-    res.json({
-        queueLength: activeCount,
-        expiredSessions: expiredCount,
+    // I'm Up / Keep Connection Alive
+    socket.on('im-up', () => {
+        dataStore.updateLastSeen(socket.sessionId);
+        console.log(`User ${socket.sessionId} is up.`);
+    });
+
+    // Handle Offer from Main User
+    socket.on('send-offer', ({ toSessionId, offer }) => {
+        io.to(toSessionId).emit('receive-offer', { fromSessionId: socket.sessionId, offer });
+        console.log(`Offer sent from ${socket.sessionId} to ${toSessionId}`);
+    });
+
+    // Handle Answer from Guest User
+    socket.on('send-answer', ({ toSessionId, answer }) => {
+        io.to(toSessionId).emit('receive-answer', { fromSessionId: socket.sessionId, answer });
+        console.log(`Answer sent from ${socket.sessionId} to ${toSessionId}`);
+    });
+
+    // Handle ICE Candidate
+    socket.on('send-ice-candidate', ({ toSessionId, candidate }) => {
+        io.to(toSessionId).emit('receive-ice-candidate', { fromSessionId: socket.sessionId, candidate });
+        console.log(`ICE Candidate sent from ${socket.sessionId} to ${toSessionId}`);
+    });
+
+    // Handle chat messages
+    socket.on('send-message', ({ toSessionId, message }) => {
+        io.to(toSessionId).emit('receive-message', { fromSessionId: socket.sessionId, message });
+        console.log(`Message sent from ${socket.sessionId} to ${toSessionId}: ${message}`);
+    });
+
+    // Disconnect Handling
+    socket.on('disconnect', () => {
+        console.log('Client disconnected:', socket.id);
+        dataStore.removeUser(socket.sessionId);
     });
 });
 
-// I'm Up Endpoint
-app.post('/im-up', (req, res) => {
-    const { sessionId } = req.body;
-    const user = users.find(user => user.sessionId === sessionId);
-
-    if (user) {
-        user.lastPing = Date.now();
-        res.json({ message: 'Ping updated' });
-    } else {
-        res.status(404).json({ message: 'Session not found' });
-    }
-});
-
-app.listen(PORT, () => {
+server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
